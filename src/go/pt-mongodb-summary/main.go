@@ -418,6 +418,7 @@ func main() {
 	ci.MongosInfo, err = getMongosInfo(ctx, client)
 	if err != nil {
 		log.Warnf("[Warning] cannot get mongos info: %v\n", err)
+		ci.MongosInfo = &mongosInfo{}
 	}
 	ptDebugf("collecting host info")
 	ci.HostInfo, err = getHostInfo(ctx, client)
@@ -452,9 +453,11 @@ func main() {
 		ptDebugf("collecting security settings")
 		if ci.SecuritySettings, err = getSecuritySettings(ctx, client, ci.HostInfo.Version); err != nil {
 			log.Errorf("[Error] cannot get security settings: %v\n", err)
+			ci.SecuritySettings = &security{}
 		}
 	} else {
 		log.Warn("Cannot check security settings since host info is not available (permissions?)")
+		ci.SecuritySettings = &security{}
 	}
 
 	ptDebugf("collecting FCV")
@@ -652,14 +655,28 @@ func formatResults(ci *collectedInfo, format string) ([]byte, error) {
 }
 
 func getHostInfo(ctx context.Context, client *mongo.Client) (*hostInfo, error) {
-	hi := proto.HostInfo{}
-	if err := client.Database("admin").RunCommand(ctx, primitive.M{"hostInfo": 1}).Decode(&hi); err != nil {
-		log.Debugf("run('hostInfo') error: %s", err)
+	// isMaster requires no special privilege and reports arbiterOnly reliably,
+	// so determine the node type before relying on commands that an arbiter's
+	// user may not be authorized to run (arbiters hold no data, including
+	// admin.system.users, so their authorization can differ from data-bearing members).
+	nodeType, _ := getNodeType(ctx, client)
 
-		return nil, errors.Wrap(err, "GetHostInfo.hostInfo")
+	hi := proto.HostInfo{}
+	hostInfoErr := client.Database("admin").RunCommand(ctx, primitive.M{"hostInfo": 1}).Decode(&hi)
+	if hostInfoErr != nil {
+		log.Debugf("run('hostInfo') error: %s", hostInfoErr)
+
+		if nodeType != "arbiter" {
+			return nil, errors.Wrap(hostInfoErr, "GetHostInfo.hostInfo")
+		}
+	}
+	if hi.System == nil {
+		hi.System = &proto.System{}
+	}
+	if hi.Os == nil {
+		hi.Os = &proto.Os{}
 	}
 
-	nodeType, _ := getNodeType(ctx, client)
 	procCount, _ := countMongodProcesses()
 
 	i := &hostInfo{
@@ -915,7 +932,9 @@ func getNodeType(ctx context.Context, client *mongo.Client) (string, error) {
 		return "", err
 	}
 
-	if md.SetName != nil || md.Hosts != nil {
+	if md.ArbiterOnly {
+		return "arbiter", nil
+	} else if md.SetName != nil || md.Hosts != nil {
 		return "replset", nil
 	} else if md.Msg == "isdbgrid" {
 		// isdbgrid is always the msg value when calling isMaster on a mongos
